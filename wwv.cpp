@@ -4,19 +4,27 @@
 #include <cmath>
 #include <deque>
 
+#include <q/fx/envelope.hpp>
+#include <q/fx/dynamic.hpp>
+#include <q/fx/noise_gate.hpp>
+#include <q/fx/dc_block.hpp>
+#include <q/fx/moving_average.hpp>
+
 #include "filt.h"
 
-const double WWV_SUBCARRIER_HZ = 100.0;
-const int SAMPLE_RATE = 8000;
-const int GOERTZEL_M = SAMPLE_RATE * 0.01; // number of samples corresponding to a 0 or 1 for the carrier
-const double GOERTZEL_K = WWV_SUBCARRIER_HZ * GOERTZEL_M / (float)SAMPLE_RATE;
-const double GOERTZEL_COEFF = 2.0 * cos((2.0 * M_PI * WWV_SUBCARRIER_HZ) / (float)SAMPLE_RATE);
-const double GOERTZEL_COEFF_IMAG = sin((2.0 * M_PI * WWV_SUBCARRIER_HZ) / (float)SAMPLE_RATE);
-const double MIN_POWER_FOR_1 = 2e8;
+using namespace cycfi::q::literals;
 
-std::deque<short> samplesSeen;
+const int SAMPLE_RATE = 8000;
+const int NUM_BLOCKS_PER_10_MS = SAMPLE_RATE * 0.01; // number of samples corresponding to a 0 or 1 for the carrier
+
+cycfi::q::fast_ave_envelope_follower follower(2_ms, SAMPLE_RATE);
+cycfi::q::noise_gate ng(-32.5_dB);
+cycfi::q::dc_block dcBlocker(60_Hz, SAMPLE_RATE);
+cycfi::q::moving_average noiseAvg(200_ms, SAMPLE_RATE);
+
+std::deque<char> carriersSeen;
 std::deque<double> windowCoeffs;
-int phasesRemaining = GOERTZEL_M;
+int phasesRemaining = NUM_BLOCKS_PER_10_MS;
 bool lookingForPhase = true;
 
 enum 
@@ -34,11 +42,11 @@ int positionsRemaining = 0;
 // Predefined vectors indicating the possible "characters"
 // WWV/WWVH can send using the 100 Hz subcarrier.
 //
-// Note: each 1 and 0 below is 10ms (see GOERTZEL_M above),
-// making each row 70-100ms long. 1 indicates the presence
-// of the 100 Hz carrier, 0 otherwise. Characters are defined
-// beginning from when the carrier becomes high until when
-// the next one should be present.
+// Note: each 1 and 0 below is 10ms, making each row 70-100ms 
+// long. 1 indicates the presence of the 100 Hz carrier, 0 
+// otherwise. Characters are defined beginning from when 
+// the carrier becomes high until when the next one should 
+// be present.
 //=========================================================
 std::deque<char> ReferenceMarker = {
     // 0.770s position identifier (P0)
@@ -150,24 +158,6 @@ bool fuzzyMatch(std::deque<char>& one, std::deque<char>& other)
      return true;
 }
 
-std::deque<char> carriersSeen;
-
-#include <q/fx/envelope.hpp>
-#include <q/fx/dynamic.hpp>
-#include <q/fx/noise_gate.hpp>
-#include <q/fx/dc_block.hpp>
-#include <q/fx/moving_average.hpp>
-
-using namespace cycfi::q::literals;
-
-cycfi::q::fast_ave_envelope_follower follower(2_ms, SAMPLE_RATE);
-cycfi::q::noise_gate ng(-32.5_dB);
-cycfi::q::dc_block dcBlocker(60_Hz, SAMPLE_RATE);
-cycfi::q::moving_average noiseAvg(200_ms, SAMPLE_RATE);
-
-int sampCount = -1;
-int sampSum = 0;
-
 void processIncomingSample(short sample)
 {
     auto floatSample = (float)sample / SHRT_MAX;    
@@ -178,10 +168,8 @@ void processIncomingSample(short sample)
     // attempt a symbol decode.
     noiseAvg(followOut);
     
-    //auto gainVal = gc(followOut, 15_dB);
     auto gateVal = ng(followOut);
     
-    //std::cout << (gateVal ? 1 : 0);
     carriersSeen.push_back(gateVal ? 1 : 0);
     
     if (carriersSeen[0] == 0)
@@ -192,105 +180,8 @@ void processIncomingSample(short sample)
     }
 }
 
-#if 0
-std::deque<char> processIncomingSample(short sample)
-{
-    if (windowCoeffs.size() == 0)
-    {
-        for (int i = 0; i < GOERTZEL_M; i++)
-        {
-            double tmp = sin(M_PI * i / GOERTZEL_M);
-            windowCoeffs.push_back(tmp * tmp);
-        }
-    }
-    
-    std::deque<char> result;
-    samplesSeen.push_back(sample);
-    if (samplesSeen.size() > GOERTZEL_M * ReferenceMarker.size())
-    {
-        // Only keep enough samples to handle a reference marker.
-        samplesSeen.pop_front();
-        
-        // If we couldn't get a lock on the signal by checking all GOERTZEL_M
-        // starting points, we should just clear the remaining samples that would have
-        // been part of the reference marker and try again next time around. This
-        // is hopefully a reasonable optimization to allow this to run in real time.
-        if (lookingForPhase)
-        {
-            phasesRemaining--;
-            if (phasesRemaining == 0)
-            {
-                phasesRemaining = GOERTZEL_M;
-                for (int i = 0; samplesSeen.size() > 0 && i < GOERTZEL_M * ReferenceMarker.size() - phasesRemaining; i++)
-                {
-                    samplesSeen.pop_front();
-                }
-            }
-        }
-    }
-    
-    if ((currentState == WAITING_FOR_BEGINNING && samplesSeen.size() < GOERTZEL_M * ReferenceMarker.size()) ||
-        (samplesSeen.size() < GOERTZEL_M * OneBit.size()))
-    {
-        // Not enough samples yet, don't bother running the rest of this method until we do.
-        return result;
-    }
-    
-    int index = 0;
-    for (int sampleRun = 0; sampleRun < floor(samplesSeen.size() / GOERTZEL_M); sampleRun++)
-    {
-        int numSamplesSeen = 0;
-        double u0 = 0;
-        double u1 = 0;
-        
-        for (; numSamplesSeen < GOERTZEL_M; numSamplesSeen++, index++)
-        {
-            double sampleAsFloat = (double)samplesSeen[index] * windowCoeffs[numSamplesSeen]; // / SHRT_MAX;
-            
-            // Apply Hann window first
-            //float hannCoeff = sin(M_PI * numSamplesSeen / GOERTZEL_M);
-            //sampleAsFloat *= hannCoeff * hannCoeff; // sin^2
-            
-            double tmp = sampleAsFloat + (GOERTZEL_COEFF * u0) - u1;
-            u1 = u0;
-            u0 = tmp;
-        }
-        
-        double resultMag = (u0 * u0) + (u1 * u1) - (GOERTZEL_COEFF * u0 * u1);
-        //carrierPresent = power > MIN_POWER_FOR_1;
-        //float resultR = 0.5 * GOERTZEL_COEFF * u0 - u1;
-        //float resultI = GOERTZEL_COEFF_IMAG * u0;
-        //float resultMag = resultR * resultR + resultI * resultI;
-        
-        //std::cout << resultMag << " ";
-        result.push_back(resultMag > MIN_POWER_FOR_1 ? 1 : 0);
-    }
-    
-    //std::cout << std::endl;
-    
-    // debug: print result before returning
-    /*if (currentState != WAITING_FOR_BEGINNING)*/
-    /*{
-        for (auto& x : result)
-        {
-            if (x) std::cout << "1";
-            else std::cout << "0";
-        }
-        std::cout << std::endl;
-    }*/
-    
-    return result;
-}
-#endif
-
 void parseTimeCode(std::deque<char>& timeCodeSeen)
 {
-    /*for (auto& x : timeCodeSeen)
-    {
-        std::cout << x << " ";
-    }
-    std::cout << std::endl;*/
-    
     int year = 2000 + 
         (timeCodeSeen[4] == '1' ? 1 : 0) +
         (timeCodeSeen[5] == '1' ? 2 : 0) +
@@ -345,7 +236,7 @@ void processMarkers(std::deque<char>& orig, std::deque<char>& processed)
     // Converts 10ms blocks into 1ms blocks.
     for (auto& item : orig)
     {
-        for (int index = 0; index < GOERTZEL_M; index++)
+        for (int index = 0; index < NUM_BLOCKS_PER_10_MS; index++)
         {
             processed.push_back(item);
         }
@@ -357,8 +248,6 @@ int main()
     short sampleShort = 0;
     std::deque<char> timeCodeSeen;
     
-    /*cycfi::q::agc gc(37_dB);
-    cycfi::q::noise_gate ng(-52.5_dB);*/
     cycfi::q::fast_rms_envelope_follower_db follower(1_s, SAMPLE_RATE);
     cycfi::q::moving_average volAvg(1_s, SAMPLE_RATE);
 
@@ -368,18 +257,17 @@ int main()
     processMarkers(ZeroBit, ZeroBitProcessed);
     
     Filter filt(BPF, 255, SAMPLE_RATE, 75, 150);
-    //Filter filt(BPF, 1000, SAMPLE_RATE, 95, 105);
     if (filt.get_error_flag() != 0)
     {
         std::cout << "Filter error: " << filt.get_error_flag() << std::endl;
     }
 
-    FILE* fp = fopen("tmp.raw", "wb");
-    assert(fp != nullptr);
+    //FILE* fp = fopen("tmp.raw", "wb");
+    //assert(fp != nullptr);
     
     while (fread((void*)&sampleShort, sizeof(short), 1, stdin) > 0)
     {
-        // block DC
+        // Block DC and amplify signal so that the decoder can pick it up.
         float blockedAudio = dcBlocker((double)sampleShort / SHRT_MAX);
         
         sampleShort = (short)filt.do_sample(blockedAudio * SHRT_MAX);
@@ -387,31 +275,11 @@ int main()
         auto followedEnv = follower((double)sampleShort / SHRT_MAX);
         auto dbRequiredtoAdd = -6_dB + -followedEnv;
         auto multiplier = cycfi::q::lin_double(dbRequiredtoAdd);
-        //auto multiplier = cycfi::q::lin_double(-6_dB) / volAvg(cycfi::q::lin_double(followedEnv));
-        
-        //auto multiplier = 1 - abs(avg); //lin_double(-cycfi::q::lin_to_db(-avg));
-        //std::cout << multiplier << std::endl;
+
         sampleShort *= multiplier;
         
-        fwrite(&sampleShort, sizeof(short), 1, fp);
+        //fwrite(&sampleShort, sizeof(short), 1, fp);
         
-        // Envelope
-        /*auto envOut = follower((double)sampleShort / SHRT_MAX);
-
-        // Noise gate -- mute anything under it so we don't
-        // get any false positives later.
-        if (ng(lin_float(envOut)) == 0)
-        {
-            sampleShort = 0;
-        }
-        
-        // AGC
-        auto gainDB = gc(envOut, -6_dB);
-        sampleShort *= lin_float(gainDB);*/
-        
-        //std::cout << "multiplier: " << lin_float(gainDB) << std::endl;
-        
-        //carriersSeen = processIncomingSample(sampleShort);
         processIncomingSample(sampleShort);
         
         bool adjustNoiseGate = false;
@@ -456,7 +324,6 @@ int main()
                         // The channel was too noisy to receive the reference marker
                         // (or we started listening in the middle of a time code).
                         // Only pop the beginning of the list in case of the latter.
-                        //samplesSeen.pop_front();
                         carriersSeen.pop_front();
                     }
                     
@@ -465,7 +332,6 @@ int main()
                         for (int i = 0; i < numCarriersToPop; i++)
                         {
                             carriersSeen.pop_front();
-                            //samplesSeen.pop_front();
                         }
                     }
                 }
@@ -498,7 +364,6 @@ int main()
                             {
                                 // We should have a full timecode now, print it out for now
                                 // TBD: do other things with it (e.g. generate Unix timestamp, inject into chrony)
-                                //std::cout << (const char*)&timeCodeSeen << std::endl;
                                 std::cout << std::endl;
                                 parseTimeCode(timeCodeSeen);
                                 timeCodeSeen.clear();
@@ -517,6 +382,7 @@ int main()
                         // We lost the WWV signal, so wait for another reference marker
                         currentState = WAITING_FOR_BEGINNING;
                         std::cout << std::endl << "lost sync during data wait" << std::endl;
+                        lookingForPhase = true;
                         /*
                         std::cout << "Expected (0): ";
                         for (auto& x : ZeroBitProcessed)
@@ -541,7 +407,6 @@ int main()
                         timeCodeSeen.clear();
                     }
                     
-                    //samplesSeen.clear();
                     carriersSeen.clear();
                 }
                 break;
@@ -565,9 +430,10 @@ int main()
                         std::cout << std::endl << "lost sync during position wait" << std::endl;
                         currentState = WAITING_FOR_BEGINNING;
                         timeCodeSeen.clear();
+                        
+                        lookingForPhase = false;
                     }
                     
-                    //samplesSeen.clear();
                     carriersSeen.clear();
                 }
                 break;
@@ -578,13 +444,12 @@ int main()
             // Adjust noise gate threshold for next go-around.
             auto noiseLevelDB = cycfi::q::lin_to_db(noiseAvg());
             ng.release_threshold(noiseLevelDB);
-            //ng.onset_threshold(noiseLevelDB + 6_dB); // Copies what the constructor does.
         }
         
         fflush(stdout);
     }
     
-    fclose(fp);
+    //fclose(fp);
     
     return 0;
 }
