@@ -9,12 +9,12 @@ An audio source capable of 16 bit samples at 8 KHz sample rate (e.g. librtlsdr).
 ## Compiling the source code
 
 ```
-git submodule update --init --recursive
-mkdir build
-cd build
-cmake ..
-make
-``
+$ git submodule update --init --recursive
+$ mkdir build
+$ cd build
+$ cmake ..
+$ make
+```
 
 ## Running the application
 
