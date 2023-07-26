@@ -580,6 +580,8 @@ int main()
             ng.release_threshold(noiseLevelDB);
             //ng.onset_threshold(noiseLevelDB + 6_dB); // Copies what the constructor does.
         }
+        
+        fflush(stdout);
     }
     
     fclose(fp);
