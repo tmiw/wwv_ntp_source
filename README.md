@@ -33,6 +33,6 @@ frequencies used by WWV/WWVH) and feeds the audio to this tool at 8 KHz sample r
 
 ### License
 
-See [LICENSE.md](./LICENSE.md) for more details.
+See [LICENSE](./LICENSE) for more details.
 
 
